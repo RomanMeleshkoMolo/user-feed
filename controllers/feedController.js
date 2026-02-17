@@ -49,6 +49,10 @@ function toFeedUser(user) {
     userLocation: user.userLocation,
     userPhoto: user.userPhoto || [],
     userPhotoUrls: user.userPhotoUrls || [],
+    wishUser: user.wishUser,
+    userSex: user.userSex,
+    isOnline: user.isOnline || false,
+    lastSeen: user.lastSeen || null,
   };
 }
 
