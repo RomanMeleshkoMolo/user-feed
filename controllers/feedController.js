@@ -53,6 +53,17 @@ function toFeedUser(user) {
     userSex: user.userSex,
     isOnline: user.isOnline || false,
     lastSeen: user.lastSeen || null,
+    lookingFor: user.lookingFor || null,
+    about: user.about || null,
+    work: user.work || null,
+    education: user.education || null,
+    zodiac: user.zodiac || null,
+    languages: user.languages || [],
+    children: user.children || null,
+    pets: user.pets || null,
+    smoking: user.smoking || null,
+    alcohol: user.alcohol || null,
+    relationship: user.relationship || null,
   };
 }
 
@@ -124,6 +135,7 @@ async function getFeed(req, res) {
 
     const filter = {
       _id: { $ne: currentUserObjectId },
+      onboardingComplete: true, // только пользователи завершившие регистрацию
     };
 
     // TODO: Раскомментировать после отладки
