@@ -86,6 +86,10 @@ async function enrichUserWithPhotos(user) {
         if (photo && typeof photo === 'object' && photo.key) {
           return await getGetObjectUrl(photo.key);
         }
+        // Если объект имеет url (прямая ссылка без S3 key)
+        if (photo && typeof photo === 'object' && photo.url && photo.url.startsWith('http')) {
+          return photo.url;
+        }
         // Если это строка (S3 key или URL)
         if (typeof photo === 'string' && photo.length > 0) {
           // Если уже URL - возвращаем как есть
@@ -118,7 +122,7 @@ async function getFeed(req, res) {
 
     // Пагинация
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 10));
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
     const skip = (page - 1) * limit;
 
     // Получаем текущего пользователя для фильтрации по предпочтениям
