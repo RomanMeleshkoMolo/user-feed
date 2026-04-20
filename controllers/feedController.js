@@ -139,25 +139,86 @@ async function getFeed(req, res) {
 
     const filter = {
       _id: { $ne: currentUserObjectId },
-      onboardingComplete: true, // только пользователи завершившие регистрацию
     };
 
-    // TODO: Раскомментировать после отладки
-    // Фильтр по полу (wishUser текущего пользователя)
-    // if (currentUser.wishUser && currentUser.wishUser !== 'all') {
-    //   filter.$or = [
-    //     { gender: currentUser.wishUser },
-    //     { 'gender.title': currentUser.wishUser },
-    //   ];
-    // }
+    const q = req.query;
+
+    // Пол кандидатов (gender хранится как объект { id, title })
+    if (q.lookingFor && q.lookingFor !== 'any') {
+      filter['gender.id'] = q.lookingFor;
+    }
+
+    // Возраст
+    if (q.ageMin || q.ageMax) {
+      filter.age = {};
+      if (q.ageMin) filter.age.$gte = Number(q.ageMin);
+      if (q.ageMax) filter.age.$lte = Number(q.ageMax);
+    }
+
+    // Онлайн
+    if (q.online === 'true') {
+      filter.isOnline = true;
+    }
+
+    // Ориентация
+    if (q.orientation) {
+      filter.userSex = q.orientation;
+    }
+
+    // Цели кандидата (lookingFor.id через запятую)
+    if (q.goals) {
+      const goalsList = q.goals.split(',').filter(Boolean);
+      if (goalsList.length > 0) filter['lookingFor.id'] = { $in: goalsList };
+    }
+
+    // Знак зодиака
+    if (q.zodiac) filter.zodiac = q.zodiac;
+
+    // Языки (any match)
+    if (q.languages) {
+      const langList = q.languages.split(',').filter(Boolean);
+      if (langList.length > 0) filter.languages = { $in: langList };
+    }
+
+    // Дети
+    if (q.children) filter.children = q.children;
+
+    // Питомцы (any match)
+    if (q.pets) {
+      const petsList = q.pets.split(',').filter(Boolean);
+      if (petsList.length > 0) filter.pets = { $in: petsList };
+    }
+
+    // Курение
+    if (q.smoking) filter.smoking = q.smoking;
+
+    // Алкоголь
+    if (q.alcohol) filter.alcohol = q.alcohol;
+
+    // Отношения
+    if (q.relationship) filter.relationship = q.relationship;
+
+    // Образование
+    if (q.education) filter.education = q.education;
 
     console.log('[feed GET] filter:', JSON.stringify(filter));
 
     // Получаем пользователей
-    const users = await User.find(filter)
+    let users = await User.find(filter)
       .skip(skip)
-      .limit(limit + 1) // +1 для проверки hasMore
+      .limit(limit + 1)
       .lean();
+
+    // Fallback: если фильтры дали 0 результатов и это не строгий запрос — показываем всех
+    const hasActiveFilters = Object.keys(filter).length > 1;
+    const isStrict = q.strict === 'true';
+    if (users.length === 0 && hasActiveFilters && page === 1 && !isStrict) {
+      console.log('[feed GET] fallback to no filters');
+      users = await User.find({ _id: { $ne: currentUserObjectId } })
+        .skip(skip)
+        .limit(limit + 1)
+        .lean();
+    }
 
     console.log('[feed GET] found users:', users.length, users.map(u => u.name));
 
