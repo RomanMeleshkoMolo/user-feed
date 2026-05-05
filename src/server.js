@@ -3,6 +3,10 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 require('dotenv').config();
 
+require('./db');
+require('./redis');
+const cacheWarmer = require('./cacheWarmer');
+
 // Connect routers
 const feed = require('../routes/feed');
 
@@ -17,4 +21,5 @@ app.use(feed);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`User Feed Service is running on http://localhost:${PORT}`);
+  cacheWarmer.start();
 });

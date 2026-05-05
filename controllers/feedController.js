@@ -1,6 +1,7 @@
 // controllers/feedController.js
 const mongoose = require('mongoose');
 const User = require('../models/userModel');
+const { get, set, del, delByPattern, hashQuery, TTL } = require('../src/cache');
 
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
@@ -19,7 +20,6 @@ const s3 = new S3Client({
     : undefined,
 });
 
-// Получить userId из запроса
 function getReqUserId(req) {
   return (
     req.user?._id ||
@@ -30,14 +30,21 @@ function getReqUserId(req) {
   );
 }
 
-// Генерация presigned URL для S3
+// Presigned URL — кешируем на 55 минут (сам URL живёт 60 мин)
 async function getGetObjectUrl(key, expiresInSec = PRESIGNED_TTL_SEC) {
   if (!key) return null;
+
+  const cacheKey = `s3_url:${key}`;
+  const cached = await get(cacheKey);
+  if (cached) return cached;
+
   const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: key });
-  return getSignedUrl(s3, cmd, { expiresIn: expiresInSec });
+  const url = await getSignedUrl(s3, cmd, { expiresIn: expiresInSec });
+
+  await set(cacheKey, url, TTL.S3_URL);
+  return url;
 }
 
-// Преобразование пользователя в безопасный формат для отправки
 function toFeedUser(user) {
   return {
     _id: user._id,
@@ -67,36 +74,19 @@ function toFeedUser(user) {
   };
 }
 
-// Добавить presigned URLs к фотографиям пользователя
 async function enrichUserWithPhotos(user) {
   const feedUser = toFeedUser(user);
 
-  // userPhoto может быть:
-  // 1. Массив объектов { key, bucket, status, ... }
-  // 2. Массив строк (S3 keys или URLs)
   if (feedUser.userPhoto && feedUser.userPhoto.length > 0) {
-    // Фильтруем только approved фото (если есть статус)
     const approvedPhotos = feedUser.userPhoto.filter(
       (p) => !p.status || p.status === 'approved'
     );
-
     feedUser.photoUrls = await Promise.all(
       approvedPhotos.map(async (photo) => {
-        // Если это объект с key
-        if (photo && typeof photo === 'object' && photo.key) {
-          return await getGetObjectUrl(photo.key);
-        }
-        // Если объект имеет url (прямая ссылка без S3 key)
-        if (photo && typeof photo === 'object' && photo.url && photo.url.startsWith('http')) {
-          return photo.url;
-        }
-        // Если это строка (S3 key или URL)
+        if (photo && typeof photo === 'object' && photo.key) return await getGetObjectUrl(photo.key);
+        if (photo && typeof photo === 'object' && photo.url && photo.url.startsWith('http')) return photo.url;
         if (typeof photo === 'string' && photo.length > 0) {
-          // Если уже URL - возвращаем как есть
-          if (photo.startsWith('http')) {
-            return photo;
-          }
-          // Иначе это S3 key
+          if (photo.startsWith('http')) return photo;
           return await getGetObjectUrl(photo);
         }
         return null;
@@ -110,141 +100,99 @@ async function enrichUserWithPhotos(user) {
   return feedUser;
 }
 
-// GET /feed - получить ленту пользователей
+// ─── Ядро: построение ленты для userId + queryParams ───────────────────────
+// Используется и контроллером (через req/res), и cacheWarmer напрямую
+async function buildFeedData(userId, q = {}) {
+  const page = Math.max(1, parseInt(q.page) || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(q.limit) || 50));
+  const skip = (page - 1) * limit;
+
+  // Текущий пользователь — кешируем отдельно
+  let currentUser = await get(`cur_user:${userId}`);
+  if (!currentUser) {
+    currentUser = await User.findById(userId).lean();
+    if (currentUser) await set(`cur_user:${userId}`, currentUser, TTL.CURRENT_USER);
+  }
+  if (!currentUser) return null;
+
+  const currentUserObjectId = new mongoose.Types.ObjectId(userId);
+  const filter = { _id: { $ne: currentUserObjectId } };
+
+  if (q.lookingFor && q.lookingFor !== 'any') filter['gender.id'] = q.lookingFor;
+  if (q.ageMin || q.ageMax) {
+    filter.age = {};
+    if (q.ageMin) filter.age.$gte = Number(q.ageMin);
+    if (q.ageMax) filter.age.$lte = Number(q.ageMax);
+  }
+  if (q.online === 'true') filter.isOnline = true;
+  if (q.orientation) filter.userSex = q.orientation;
+  if (q.goals) {
+    const goalsList = q.goals.split(',').filter(Boolean);
+    if (goalsList.length > 0) filter['lookingFor.id'] = { $in: goalsList };
+  }
+  if (q.zodiac) filter.zodiac = q.zodiac;
+  if (q.languages) {
+    const langList = q.languages.split(',').filter(Boolean);
+    if (langList.length > 0) filter.languages = { $in: langList };
+  }
+  if (q.children) filter.children = q.children;
+  if (q.pets) {
+    const petsList = q.pets.split(',').filter(Boolean);
+    if (petsList.length > 0) filter.pets = { $in: petsList };
+  }
+  if (q.smoking) filter.smoking = q.smoking;
+  if (q.alcohol) filter.alcohol = q.alcohol;
+  if (q.relationship) filter.relationship = q.relationship;
+  if (q.education) filter.education = q.education;
+
+  let users = await User.find(filter).skip(skip).limit(limit + 1).lean();
+
+  const hasActiveFilters = Object.keys(filter).length > 1;
+  const isStrict = q.strict === 'true';
+  if (users.length === 0 && hasActiveFilters && page === 1 && !isStrict) {
+    users = await User.find({ _id: { $ne: currentUserObjectId } })
+      .skip(skip).limit(limit + 1).lean();
+  }
+
+  const hasMore = users.length > limit;
+  const usersToReturn = hasMore ? users.slice(0, limit) : users;
+  const enrichedUsers = await Promise.all(usersToReturn.map(enrichUserWithPhotos));
+
+  return { users: enrichedUsers, page, hasMore };
+}
+
+// GET /feed
 async function getFeed(req, res) {
   try {
     const currentUserId = getReqUserId(req);
-    console.log('[feed GET] currentUserId:', currentUserId);
-
     if (!currentUserId || !mongoose.Types.ObjectId.isValid(String(currentUserId))) {
       return res.status(401).json({ message: 'Unauthorized: user id not found' });
     }
 
-    // Пагинация
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
-    const skip = (page - 1) * limit;
+    const filterHash = hashQuery({ ...req.query, page: String(req.query.page || 1), limit: String(req.query.limit || 50) });
+    const feedCacheKey = `feed:${currentUserId}:${filterHash}`;
 
-    // Получаем текущего пользователя для фильтрации по предпочтениям
-    const currentUser = await User.findById(currentUserId).lean();
-    console.log('[feed GET] currentUser:', currentUser?.name, 'wishUser:', currentUser?.wishUser);
-
-    if (!currentUser) {
-      return res.status(404).json({ message: 'Current user not found' });
+    const cached = await get(feedCacheKey);
+    if (cached) {
+      console.log(`[feed GET] cache HIT — key=${feedCacheKey}`);
+      return res.json(cached);
     }
+    console.log(`[feed GET] cache MISS — key=${feedCacheKey}`);
 
-    // Строим фильтр для поиска пользователей
-    // Конвертируем в ObjectId для корректного сравнения
-    const currentUserObjectId = new mongoose.Types.ObjectId(currentUserId);
+    const result = await buildFeedData(String(currentUserId), req.query);
+    if (!result) return res.status(404).json({ message: 'Current user not found' });
 
-    const filter = {
-      _id: { $ne: currentUserObjectId },
-    };
+    await set(feedCacheKey, result, TTL.FEED);
+    console.log(`[feed GET] cache SET — key=${feedCacheKey}, users=${result.users.length}`);
 
-    const q = req.query;
-
-    // Пол кандидатов (gender хранится как объект { id, title })
-    if (q.lookingFor && q.lookingFor !== 'any') {
-      filter['gender.id'] = q.lookingFor;
-    }
-
-    // Возраст
-    if (q.ageMin || q.ageMax) {
-      filter.age = {};
-      if (q.ageMin) filter.age.$gte = Number(q.ageMin);
-      if (q.ageMax) filter.age.$lte = Number(q.ageMax);
-    }
-
-    // Онлайн
-    if (q.online === 'true') {
-      filter.isOnline = true;
-    }
-
-    // Ориентация
-    if (q.orientation) {
-      filter.userSex = q.orientation;
-    }
-
-    // Цели кандидата (lookingFor.id через запятую)
-    if (q.goals) {
-      const goalsList = q.goals.split(',').filter(Boolean);
-      if (goalsList.length > 0) filter['lookingFor.id'] = { $in: goalsList };
-    }
-
-    // Знак зодиака
-    if (q.zodiac) filter.zodiac = q.zodiac;
-
-    // Языки (any match)
-    if (q.languages) {
-      const langList = q.languages.split(',').filter(Boolean);
-      if (langList.length > 0) filter.languages = { $in: langList };
-    }
-
-    // Дети
-    if (q.children) filter.children = q.children;
-
-    // Питомцы (any match)
-    if (q.pets) {
-      const petsList = q.pets.split(',').filter(Boolean);
-      if (petsList.length > 0) filter.pets = { $in: petsList };
-    }
-
-    // Курение
-    if (q.smoking) filter.smoking = q.smoking;
-
-    // Алкоголь
-    if (q.alcohol) filter.alcohol = q.alcohol;
-
-    // Отношения
-    if (q.relationship) filter.relationship = q.relationship;
-
-    // Образование
-    if (q.education) filter.education = q.education;
-
-    console.log('[feed GET] filter:', JSON.stringify(filter));
-
-    // Получаем пользователей
-    let users = await User.find(filter)
-      .skip(skip)
-      .limit(limit + 1)
-      .lean();
-
-    // Fallback: если фильтры дали 0 результатов и это не строгий запрос — показываем всех
-    const hasActiveFilters = Object.keys(filter).length > 1;
-    const isStrict = q.strict === 'true';
-    if (users.length === 0 && hasActiveFilters && page === 1 && !isStrict) {
-      console.log('[feed GET] fallback to no filters');
-      users = await User.find({ _id: { $ne: currentUserObjectId } })
-        .skip(skip)
-        .limit(limit + 1)
-        .lean();
-    }
-
-    console.log('[feed GET] found users:', users.length, users.map(u => u.name));
-
-    // Проверяем, есть ли ещё пользователи
-    const hasMore = users.length > limit;
-    const usersToReturn = hasMore ? users.slice(0, limit) : users;
-
-    // Обогащаем пользователей presigned URLs для фотографий
-    const enrichedUsers = await Promise.all(
-      usersToReturn.map(enrichUserWithPhotos)
-    );
-
-    console.log(`[feed GET] page=${page}, limit=${limit}, found=${enrichedUsers.length}, hasMore=${hasMore}`);
-
-    return res.json({
-      users: enrichedUsers,
-      page,
-      hasMore,
-    });
+    return res.json(result);
   } catch (e) {
     console.error('[feed GET] error:', e);
     return res.status(500).json({ message: 'Server error' });
   }
 }
 
-// GET /feed/:userId - получить профиль конкретного пользователя
+// GET /feed/:userId
 async function getUserProfile(req, res) {
   try {
     const currentUserId = getReqUserId(req);
@@ -253,17 +201,23 @@ async function getUserProfile(req, res) {
     if (!currentUserId || !mongoose.Types.ObjectId.isValid(String(currentUserId))) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
-
     if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
       return res.status(400).json({ message: 'Invalid user id' });
     }
 
-    const user = await User.findById(userId).lean();
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+    const profileCacheKey = `profile:${userId}`;
+    const cached = await get(profileCacheKey);
+    if (cached) {
+      console.log(`[profile GET] cache HIT — userId=${userId}`);
+      return res.json({ user: cached });
     }
 
+    const user = await User.findById(userId).lean();
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
     const enrichedUser = await enrichUserWithPhotos(user);
+    await set(profileCacheKey, enrichedUser, TTL.PROFILE);
+    console.log(`[profile GET] cache SET — userId=${userId}`);
 
     return res.json({ user: enrichedUser });
   } catch (e) {
@@ -272,7 +226,15 @@ async function getUserProfile(req, res) {
   }
 }
 
-// POST /feed/:userId/like - лайкнуть пользователя
+// Инвалидация кеша при обновлении профиля
+async function invalidateUserCache(userId) {
+  await del(`profile:${userId}`);
+  await del(`cur_user:${userId}`);
+  await delByPattern(`feed:*`);
+  console.log(`[cache] Invalidated for userId=${userId}`);
+}
+
+// POST /feed/:userId/like
 async function likeUser(req, res) {
   try {
     const currentUserId = getReqUserId(req);
@@ -281,38 +243,21 @@ async function likeUser(req, res) {
     if (!currentUserId || !mongoose.Types.ObjectId.isValid(String(currentUserId))) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
-
     if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
       return res.status(400).json({ message: 'Invalid user id' });
     }
 
-    // Проверяем, что целевой пользователь существует
     const targetUser = await User.findById(userId).lean();
-    if (!targetUser) {
-      return res.status(404).json({ message: 'User not found' });
-    }
+    if (!targetUser) return res.status(404).json({ message: 'User not found' });
 
-    // TODO: Здесь нужно добавить логику сохранения лайка в отдельную коллекцию
-    // Например, создать модель Like { fromUser, toUser, createdAt }
-    // И проверять взаимные лайки для определения матча
-
-    console.log(`[feed LIKE] user ${currentUserId} liked user ${userId}`);
-
-    // Временно возвращаем успех без проверки матча
-    // В будущем нужно добавить коллекцию лайков и проверку взаимности
-    return res.json({
-      success: true,
-      userId,
-      isMatch: false, // TODO: проверить взаимный лайк
-      match: null,
-    });
+    return res.json({ success: true, userId, isMatch: false, match: null });
   } catch (e) {
     console.error('[feed LIKE] error:', e);
     return res.status(500).json({ message: 'Server error' });
   }
 }
 
-// POST /feed/:userId/pass - пропустить пользователя
+// POST /feed/:userId/pass
 async function passUser(req, res) {
   try {
     const currentUserId = getReqUserId(req);
@@ -321,44 +266,25 @@ async function passUser(req, res) {
     if (!currentUserId || !mongoose.Types.ObjectId.isValid(String(currentUserId))) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
-
     if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
       return res.status(400).json({ message: 'Invalid user id' });
     }
 
-    // TODO: Сохранить пропуск в отдельную коллекцию, чтобы не показывать этого пользователя снова
-    // Например, создать модель Pass { fromUser, toUser, createdAt }
-
-    console.log(`[feed PASS] user ${currentUserId} passed user ${userId}`);
-
-    return res.json({
-      success: true,
-      userId,
-    });
+    return res.json({ success: true, userId });
   } catch (e) {
     console.error('[feed PASS] error:', e);
     return res.status(500).json({ message: 'Server error' });
   }
 }
 
-// GET /feed/matches - получить список матчей
+// GET /feed/matches
 async function getMatches(req, res) {
   try {
     const currentUserId = getReqUserId(req);
-
     if (!currentUserId || !mongoose.Types.ObjectId.isValid(String(currentUserId))) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
-
-    // TODO: Реализовать получение матчей из коллекции лайков
-    // Матч = когда оба пользователя лайкнули друг друга
-
-    console.log(`[feed MATCHES] getting matches for user ${currentUserId}`);
-
-    // Временно возвращаем пустой массив
-    return res.json({
-      matches: [],
-    });
+    return res.json({ matches: [] });
   } catch (e) {
     console.error('[feed MATCHES] error:', e);
     return res.status(500).json({ message: 'Server error' });
@@ -371,4 +297,6 @@ module.exports = {
   likeUser,
   passUser,
   getMatches,
+  invalidateUserCache,
+  buildFeedData,
 };
