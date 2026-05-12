@@ -1,11 +1,17 @@
 const mongoose = require('mongoose');
+require('dotenv').config();
 
-mongoose.connect('mongodb://localhost:27017/users')
-  .then(() => console.log('[DB] Connected to MongoDB'))
-  .catch(err => console.error('[DB] MongoDB connection error:', err));
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/molo_auth';
 
-mongoose.connection.on('error', err => {
-  console.error('[DB] MongoDB error:', err);
+mongoose.connect(MONGO_URI, {
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000,
+})
+  .then(() => console.log('[user-feed] MongoDB connected → molo_auth'))
+  .catch((err) => console.error('[user-feed] MongoDB connection error:', err));
+
+mongoose.connection.on('error', (err) => {
+  console.error('[user-feed] MongoDB error:', err);
 });
 
 module.exports = mongoose;
