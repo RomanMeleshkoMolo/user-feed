@@ -16,6 +16,8 @@ const PORT = process.env.PORT || 5000;
 app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
 // Use routes
 app.use(feed);
 
