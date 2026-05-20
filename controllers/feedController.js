@@ -5,6 +5,7 @@ const { get, set, del, delByPattern, hashQuery, TTL } = require('../src/cache');
 
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { buildLocationPattern } = require('../src/locationParser');
 
 const REGION = process.env.AWS_REGION || 'eu-central-1';
 const BUCKET = process.env.S3_BUCKET || 'molo-user-photos';
@@ -140,25 +141,42 @@ async function buildFeedData(userId, q = {}) {
     const petsList = q.pets.split(',').filter(Boolean);
     if (petsList.length > 0) filter.pets = { $in: petsList };
   }
+  if (q.interests) {
+    const interestsList = q.interests.split(',').filter(Boolean);
+    if (interestsList.length > 0) filter.interests = { $in: interestsList };
+  }
   if (q.smoking) filter.smoking = q.smoking;
   if (q.alcohol) filter.alcohol = q.alcohol;
   if (q.relationship) filter.relationship = q.relationship;
   if (q.education) filter.education = q.education;
+  const expansionLevel = parseInt(q.expansionLevel) || 0;
+  if (q.location) {
+    const pattern = buildLocationPattern(q.location, expansionLevel);
+    if (pattern) filter.userLocation = { $regex: pattern, $options: 'i' };
+  }
 
   let users = await User.find(filter).skip(skip).limit(limit + 1).lean();
-
-  const hasActiveFilters = Object.keys(filter).length > 1;
-  const isStrict = q.strict === 'true';
-  if (users.length === 0 && hasActiveFilters && page === 1 && !isStrict) {
-    users = await User.find({ _id: { $ne: currentUserObjectId } })
-      .skip(skip).limit(limit + 1).lean();
-  }
 
   const hasMore = users.length > limit;
   const usersToReturn = hasMore ? users.slice(0, limit) : users;
   const enrichedUsers = await Promise.all(usersToReturn.map(enrichUserWithPhotos));
 
-  return { users: enrichedUsers, page, hasMore };
+  return { users: enrichedUsers, page, hasMore, expansionLevel };
+}
+
+// Overlay свежих isOnline поверх любого ответа (кэш или свежий запрос).
+// Один lean-запрос к MongoDB только по _id + isOnline — быстро и без промашек кэша.
+async function overlayOnlineStatus(users) {
+  if (!users || users.length === 0) return;
+  try {
+    const ids = users.map(u => u._id);
+    const fresh = await User.find({ _id: { $in: ids } }, { isOnline: 1 }).lean();
+    const map = {};
+    fresh.forEach(u => { map[String(u._id)] = u.isOnline; });
+    users.forEach(u => { u.isOnline = map[String(u._id)] ?? false; });
+  } catch (e) {
+    console.error('[overlayOnlineStatus] error:', e.message);
+  }
 }
 
 // GET /feed
@@ -172,18 +190,19 @@ async function getFeed(req, res) {
     const filterHash = hashQuery({ ...req.query, page: String(req.query.page || 1), limit: String(req.query.limit || 50) });
     const feedCacheKey = `feed:${currentUserId}:${filterHash}`;
 
-    const cached = await get(feedCacheKey);
-    if (cached) {
+    let result = await get(feedCacheKey);
+    if (result) {
       console.log(`[feed GET] cache HIT — key=${feedCacheKey}`);
-      return res.json(cached);
+    } else {
+      console.log(`[feed GET] cache MISS — key=${feedCacheKey}`);
+      result = await buildFeedData(String(currentUserId), req.query);
+      if (!result) return res.status(404).json({ message: 'Current user not found' });
+      await set(feedCacheKey, result, TTL.FEED);
+      console.log(`[feed GET] cache SET — key=${feedCacheKey}, users=${result.users.length}`);
     }
-    console.log(`[feed GET] cache MISS — key=${feedCacheKey}`);
 
-    const result = await buildFeedData(String(currentUserId), req.query);
-    if (!result) return res.status(404).json({ message: 'Current user not found' });
-
-    await set(feedCacheKey, result, TTL.FEED);
-    console.log(`[feed GET] cache SET — key=${feedCacheKey}, users=${result.users.length}`);
+    // Всегда накладываем свежий isOnline поверх кэшированных данных
+    await overlayOnlineStatus(result.users);
 
     return res.json(result);
   } catch (e) {
@@ -206,18 +225,19 @@ async function getUserProfile(req, res) {
     }
 
     const profileCacheKey = `profile:${userId}`;
-    const cached = await get(profileCacheKey);
-    if (cached) {
+    let enrichedUser = await get(profileCacheKey);
+    if (enrichedUser) {
       console.log(`[profile GET] cache HIT — userId=${userId}`);
-      return res.json({ user: cached });
+    } else {
+      const user = await User.findById(userId).lean();
+      if (!user) return res.status(404).json({ message: 'User not found' });
+      enrichedUser = await enrichUserWithPhotos(user);
+      await set(profileCacheKey, enrichedUser, TTL.PROFILE);
+      console.log(`[profile GET] cache SET — userId=${userId}`);
     }
 
-    const user = await User.findById(userId).lean();
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const enrichedUser = await enrichUserWithPhotos(user);
-    await set(profileCacheKey, enrichedUser, TTL.PROFILE);
-    console.log(`[profile GET] cache SET — userId=${userId}`);
+    // Свежий isOnline поверх кэша
+    await overlayOnlineStatus([enrichedUser]);
 
     return res.json({ user: enrichedUser });
   } catch (e) {
