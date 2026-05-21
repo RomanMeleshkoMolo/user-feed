@@ -8,7 +8,11 @@ const {
   likeUser,
   passUser,
   getMatches,
+  invalidateCacheHandler,
 } = require('../controllers/feedController');
+
+// Внутренний эндпоинт — без JWT, не проксируется через Nginx
+router.post('/internal/invalidate/:userId', invalidateCacheHandler);
 
 // Все эндпоинты защищены авторизацией
 // GET /feed - получить ленту пользователей (с пагинацией)

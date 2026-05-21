@@ -254,6 +254,16 @@ async function invalidateUserCache(userId) {
   console.log(`[cache] Invalidated for userId=${userId}`);
 }
 
+// POST /internal/invalidate/:userId — вызывается другими сервисами (user-profile) при обновлении данных
+async function invalidateCacheHandler(req, res) {
+  const { userId } = req.params;
+  if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
+    return res.status(400).json({ message: 'Invalid userId' });
+  }
+  await invalidateUserCache(userId);
+  return res.json({ ok: true });
+}
+
 // POST /feed/:userId/like
 async function likeUser(req, res) {
   try {
@@ -318,5 +328,6 @@ module.exports = {
   passUser,
   getMatches,
   invalidateUserCache,
+  invalidateCacheHandler,
   buildFeedData,
 };
