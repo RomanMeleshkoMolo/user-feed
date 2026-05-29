@@ -1,6 +1,6 @@
-// controllers/feedController.js
 const mongoose = require('mongoose');
 const User = require('../models/userModel');
+const Like = require('../models/likeModel');
 const { get, set, del, delByPattern, hashQuery, TTL } = require('../src/cache');
 
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -14,101 +14,112 @@ const PRESIGNED_TTL_SEC = Number(process.env.S3_GET_TTL_SEC || 3600);
 const s3 = new S3Client({
   region: REGION,
   credentials: process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
-    ? {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-      }
+    ? { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY }
     : undefined,
 });
 
 function getReqUserId(req) {
-  return (
-    req.user?._id ||
-    req.user?.id ||
-    req.auth?.userId ||
-    req.regUserId ||
-    req.userId
-  );
+  return req.user?._id || req.user?.id || req.auth?.userId || req.regUserId || req.userId;
 }
 
-// Presigned URL — кешируем на 55 минут (сам URL живёт 60 мин)
+// Presigned URL — кешируем 55 минут
 async function getGetObjectUrl(key, expiresInSec = PRESIGNED_TTL_SEC) {
   if (!key) return null;
-
   const cacheKey = `s3_url:${key}`;
   const cached = await get(cacheKey);
   if (cached) return cached;
-
   const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: key });
   const url = await getSignedUrl(s3, cmd, { expiresIn: expiresInSec });
-
   await set(cacheKey, url, TTL.S3_URL);
   return url;
 }
 
 function toFeedUser(user) {
   return {
-    _id: user._id,
-    id: user._id,
-    name: user.name,
-    age: user.age,
-    gender: user.gender,
-    interests: user.interests || [],
+    _id:          user._id,
+    id:           user._id,
+    name:         user.name,
+    age:          user.age,
+    gender:       user.gender,
+    interests:    user.interests || [],
     userLocation: user.userLocation,
-    userPhoto: user.userPhoto || [],
+    userPhoto:    user.userPhoto || [],
     userPhotoUrls: user.userPhotoUrls || [],
-    wishUser: user.wishUser,
-    userSex: user.userSex,
-    isOnline: user.isOnline || false,
-    lastSeen: user.lastSeen || null,
-    lookingFor: user.lookingFor || null,
-    about: user.about || null,
-    work: user.work || null,
-    education: user.education || null,
-    zodiac: user.zodiac || null,
-    languages: user.languages || [],
-    children: user.children || null,
-    pets: user.pets || null,
-    smoking: user.smoking || null,
-    alcohol: user.alcohol || null,
+    wishUser:     user.wishUser,
+    userSex:      user.userSex,
+    isOnline:     user.isOnline || false,
+    lastSeen:     user.lastSeen || null,
+    lookingFor:   user.lookingFor || null,
+    about:        user.about || null,
+    work:         user.work || null,
+    education:    user.education || null,
+    zodiac:       user.zodiac || null,
+    languages:    user.languages || [],
+    children:     user.children || null,
+    pets:         user.pets || null,
+    smoking:      user.smoking || null,
+    alcohol:      user.alcohol || null,
     relationship: user.relationship || null,
   };
 }
 
 async function enrichUserWithPhotos(user) {
   const feedUser = toFeedUser(user);
-
-  if (feedUser.userPhoto && feedUser.userPhoto.length > 0) {
-    const approvedPhotos = feedUser.userPhoto.filter(
-      (p) => !p.status || p.status === 'approved'
-    );
-    feedUser.photoUrls = await Promise.all(
-      approvedPhotos.map(async (photo) => {
-        if (photo && typeof photo === 'object' && photo.key) return await getGetObjectUrl(photo.key);
-        if (photo && typeof photo === 'object' && photo.url && photo.url.startsWith('http')) return photo.url;
-        if (typeof photo === 'string' && photo.length > 0) {
-          if (photo.startsWith('http')) return photo;
-          return await getGetObjectUrl(photo);
-        }
-        return null;
-      })
-    );
-    feedUser.photoUrls = feedUser.photoUrls.filter(Boolean);
+  if (feedUser.userPhoto?.length > 0) {
+    const approved = feedUser.userPhoto.filter(p => !p.status || p.status === 'approved');
+    feedUser.photoUrls = (await Promise.all(approved.map(async (photo) => {
+      if (photo?.key) return getGetObjectUrl(photo.key);
+      if (photo?.url?.startsWith('http')) return photo.url;
+      if (typeof photo === 'string') return photo.startsWith('http') ? photo : getGetObjectUrl(photo);
+      return null;
+    }))).filter(Boolean);
   } else {
     feedUser.photoUrls = feedUser.userPhotoUrls || [];
   }
-
   return feedUser;
 }
 
-// ─── Ядро: построение ленты для userId + queryParams ───────────────────────
-// Используется и контроллером (через req/res), и cacheWarmer напрямую
-async function buildFeedData(userId, q = {}) {
-  const page = Math.max(1, parseInt(q.page) || 1);
-  const limit = Math.min(200, Math.max(1, parseInt(q.limit) || 50));
-  const skip = (page - 1) * limit;
+// ─── Scoring ──────────────────────────────────────────────────────────────────
+// +100  user liked me (pending)
+// +40   online now
+// +20   last seen < 1h
+// +10   last seen < 24h
+// +3    last seen < 7d
+// 0–20  profile completeness
+function scoreUser(user, likedMeSet) {
+  let score = 0;
 
-  // Текущий пользователь — кешируем отдельно
+  if (likedMeSet.has(String(user._id))) score += 100;
+
+  if (user.isOnline) {
+    score += 40;
+  } else if (user.lastSeen) {
+    const ageMs = Date.now() - new Date(user.lastSeen).getTime();
+    if      (ageMs < 3_600_000)   score += 20;
+    else if (ageMs < 86_400_000)  score += 10;
+    else if (ageMs < 604_800_000) score += 3;
+  }
+
+  let cp = 0;
+  const approved = (user.userPhoto || []).filter(p => !p.status || p.status === 'approved');
+  if (approved.length >= 1) cp += 5;
+  if (approved.length >= 3) cp += 3;
+  if (user.about)                          cp += 4;
+  if (user.work)                           cp += 2;
+  if (user.education)                      cp += 2;
+  if ((user.interests?.length || 0) >= 2)  cp += 2;
+  if (user.lookingFor?.id)                 cp += 2;
+  score += Math.min(20, cp);
+
+  return score;
+}
+
+// ─── Build feed data (used by controller + cacheWarmer) ──────────────────────
+async function buildFeedData(userId, q = {}) {
+  const page  = Math.max(1, parseInt(q.page) || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(q.limit) || 50));
+  const skip  = (page - 1) * limit;
+
   let currentUser = await get(`cur_user:${userId}`);
   if (!currentUser) {
     currentUser = await User.findById(userId).lean();
@@ -128,50 +139,68 @@ async function buildFeedData(userId, q = {}) {
   if (q.online === 'true') filter.isOnline = true;
   if (q.orientation) filter.userSex = q.orientation;
   if (q.goals) {
-    const goalsList = q.goals.split(',').filter(Boolean);
-    if (goalsList.length > 0) filter['lookingFor.id'] = { $in: goalsList };
+    const goals = q.goals.split(',').filter(Boolean);
+    if (goals.length) filter['lookingFor.id'] = { $in: goals };
   }
   if (q.zodiac) filter.zodiac = q.zodiac;
   if (q.languages) {
-    const langList = q.languages.split(',').filter(Boolean);
-    if (langList.length > 0) filter.languages = { $in: langList };
+    const langs = q.languages.split(',').filter(Boolean);
+    if (langs.length) filter.languages = { $in: langs };
   }
-  if (q.children) filter.children = q.children;
+  if (q.children)     filter.children = q.children;
   if (q.pets) {
-    const petsList = q.pets.split(',').filter(Boolean);
-    if (petsList.length > 0) filter.pets = { $in: petsList };
+    const pets = q.pets.split(',').filter(Boolean);
+    if (pets.length) filter.pets = { $in: pets };
   }
   if (q.interests) {
-    const interestsList = q.interests.split(',').filter(Boolean);
-    if (interestsList.length > 0) filter.interests = { $in: interestsList };
+    const ints = q.interests.split(',').filter(Boolean);
+    if (ints.length) filter.interests = { $in: ints };
   }
-  if (q.smoking) filter.smoking = q.smoking;
-  if (q.alcohol) filter.alcohol = q.alcohol;
+  if (q.smoking)      filter.smoking = q.smoking;
+  if (q.alcohol)      filter.alcohol = q.alcohol;
   if (q.relationship) filter.relationship = q.relationship;
-  if (q.education) filter.education = q.education;
+  if (q.education)    filter.education = q.education;
+
   const expansionLevel = parseInt(q.expansionLevel) || 0;
   if (q.location) {
     const pattern = buildLocationPattern(q.location, expansionLevel);
     if (pattern) filter.userLocation = { $regex: pattern, $options: 'i' };
   }
 
-  let users = await User.find(filter).skip(skip).limit(limit + 1).lean();
+  // Fetch pool (extra for scoring; respect original skip for pagination)
+  const rawUsers = await User.find(filter).skip(skip).limit(limit + 1).lean();
+  const hasMore = rawUsers.length > limit;
+  const pool    = hasMore ? rawUsers.slice(0, limit) : rawUsers;
 
-  const hasMore = users.length > limit;
-  const usersToReturn = hasMore ? users.slice(0, limit) : users;
-  const enrichedUsers = await Promise.all(usersToReturn.map(enrichUserWithPhotos));
+  // Who liked me — boost their score
+  let likedMeSet = new Set();
+  try {
+    const likesForMe = await Like.find({
+      toUser: currentUserObjectId,
+      status: 'pending',
+    }).select('fromUser').lean();
+    likesForMe.forEach(l => likedMeSet.add(String(l.fromUser)));
+  } catch (e) {
+    console.warn('[feed] Could not fetch likes:', e.message);
+  }
+
+  // Score and sort
+  const scored = pool.map(u => ({ user: u, score: scoreUser(u, likedMeSet) }));
+  scored.sort((a, b) => b.score - a.score);
+  const sorted = scored.map(s => s.user);
+
+  const enrichedUsers = await Promise.all(sorted.map(enrichUserWithPhotos));
 
   return { users: enrichedUsers, page, hasMore, expansionLevel };
 }
 
-// Overlay свежих isOnline поверх любого ответа (кэш или свежий запрос).
-// Один lean-запрос к MongoDB только по _id + isOnline — быстро и без промашек кэша.
+// Overlay свежего isOnline поверх любого ответа
 async function overlayOnlineStatus(users) {
-  if (!users || users.length === 0) return;
+  if (!users?.length) return;
   try {
-    const ids = users.map(u => u._id);
+    const ids   = users.map(u => u._id);
     const fresh = await User.find({ _id: { $in: ids } }, { isOnline: 1 }).lean();
-    const map = {};
+    const map   = {};
     fresh.forEach(u => { map[String(u._id)] = u.isOnline; });
     users.forEach(u => { u.isOnline = map[String(u._id)] ?? false; });
   } catch (e) {
@@ -187,7 +216,11 @@ async function getFeed(req, res) {
       return res.status(401).json({ message: 'Unauthorized: user id not found' });
     }
 
-    const filterHash = hashQuery({ ...req.query, page: String(req.query.page || 1), limit: String(req.query.limit || 50) });
+    const filterHash = hashQuery({
+      ...req.query,
+      page:  String(req.query.page  || 1),
+      limit: String(req.query.limit || 50),
+    });
     const feedCacheKey = `feed:${currentUserId}:${filterHash}`;
 
     let result = await get(feedCacheKey);
@@ -201,9 +234,7 @@ async function getFeed(req, res) {
       console.log(`[feed GET] cache SET — key=${feedCacheKey}, users=${result.users.length}`);
     }
 
-    // Всегда накладываем свежий isOnline поверх кэшированных данных
     await overlayOnlineStatus(result.users);
-
     return res.json(result);
   } catch (e) {
     console.error('[feed GET] error:', e);
@@ -233,12 +264,9 @@ async function getUserProfile(req, res) {
       if (!user) return res.status(404).json({ message: 'User not found' });
       enrichedUser = await enrichUserWithPhotos(user);
       await set(profileCacheKey, enrichedUser, TTL.PROFILE);
-      console.log(`[profile GET] cache SET — userId=${userId}`);
     }
 
-    // Свежий isOnline поверх кэша
     await overlayOnlineStatus([enrichedUser]);
-
     return res.json({ user: enrichedUser });
   } catch (e) {
     console.error('[feed GET user] error:', e);
@@ -246,15 +274,13 @@ async function getUserProfile(req, res) {
   }
 }
 
-// Инвалидация кеша при обновлении профиля
 async function invalidateUserCache(userId) {
   await del(`profile:${userId}`);
   await del(`cur_user:${userId}`);
-  await delByPattern(`feed:*`);
+  await delByPattern('feed:*');
   console.log(`[cache] Invalidated for userId=${userId}`);
 }
 
-// POST /internal/invalidate/:userId — вызывается другими сервисами (user-profile) при обновлении данных
 async function invalidateCacheHandler(req, res) {
   const { userId } = req.params;
   if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
@@ -269,17 +295,14 @@ async function likeUser(req, res) {
   try {
     const currentUserId = getReqUserId(req);
     const { userId } = req.params;
-
     if (!currentUserId || !mongoose.Types.ObjectId.isValid(String(currentUserId))) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
     if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
       return res.status(400).json({ message: 'Invalid user id' });
     }
-
     const targetUser = await User.findById(userId).lean();
     if (!targetUser) return res.status(404).json({ message: 'User not found' });
-
     return res.json({ success: true, userId, isMatch: false, match: null });
   } catch (e) {
     console.error('[feed LIKE] error:', e);
@@ -292,14 +315,12 @@ async function passUser(req, res) {
   try {
     const currentUserId = getReqUserId(req);
     const { userId } = req.params;
-
     if (!currentUserId || !mongoose.Types.ObjectId.isValid(String(currentUserId))) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
     if (!userId || !mongoose.Types.ObjectId.isValid(String(userId))) {
       return res.status(400).json({ message: 'Invalid user id' });
     }
-
     return res.json({ success: true, userId });
   } catch (e) {
     console.error('[feed PASS] error:', e);
