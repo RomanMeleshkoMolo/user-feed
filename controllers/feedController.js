@@ -222,16 +222,19 @@ async function getFeed(req, res) {
       limit: String(req.query.limit || 50),
     });
     const feedCacheKey = `feed:${currentUserId}:${filterHash}`;
+    const skipCache = req.query.online === 'true';
 
-    let result = await get(feedCacheKey);
+    let result = skipCache ? null : await get(feedCacheKey);
     if (result) {
       console.log(`[feed GET] cache HIT — key=${feedCacheKey}`);
     } else {
       console.log(`[feed GET] cache MISS — key=${feedCacheKey}`);
       result = await buildFeedData(String(currentUserId), req.query);
       if (!result) return res.status(404).json({ message: 'Current user not found' });
-      await set(feedCacheKey, result, TTL.FEED);
-      console.log(`[feed GET] cache SET — key=${feedCacheKey}, users=${result.users.length}`);
+      if (!skipCache) {
+        await set(feedCacheKey, result, TTL.FEED);
+        console.log(`[feed GET] cache SET — key=${feedCacheKey}, users=${result.users.length}`);
+      }
     }
 
     await overlayOnlineStatus(result.users);
