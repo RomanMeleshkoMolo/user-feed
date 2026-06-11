@@ -49,6 +49,7 @@ function toFeedUser(user) {
     userSex:      user.userSex,
     isOnline:     user.isOnline || false,
     lastSeen:     user.lastSeen || null,
+    isTop:        Boolean(user.boostUntil && new Date(user.boostUntil) > new Date()),
     lookingFor:   user.lookingFor || null,
     about:        user.about || null,
     work:         user.work || null,
@@ -80,6 +81,7 @@ async function enrichUserWithPhotos(user) {
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
+// +1000 активный буст (анкета поднята в топ)
 // +100  user liked me (pending)
 // +40   online now
 // +20   last seen < 1h
@@ -88,6 +90,8 @@ async function enrichUserWithPhotos(user) {
 // 0–20  profile completeness
 function scoreUser(user, likedMeSet) {
   let score = 0;
+
+  if (user.boostUntil && new Date(user.boostUntil) > new Date()) score += 1000;
 
   if (likedMeSet.has(String(user._id))) score += 100;
 
@@ -194,15 +198,20 @@ async function buildFeedData(userId, q = {}) {
   return { users: enrichedUsers, page, hasMore, expansionLevel };
 }
 
-// Overlay свежего isOnline поверх любого ответа
+// Overlay свежего isOnline/isTop поверх любого ответа (в т.ч. закешированного)
 async function overlayOnlineStatus(users) {
   if (!users?.length) return;
   try {
     const ids   = users.map(u => u._id);
-    const fresh = await User.find({ _id: { $in: ids } }, { isOnline: 1 }).lean();
+    const fresh = await User.find({ _id: { $in: ids } }, { isOnline: 1, boostUntil: 1 }).lean();
     const map   = {};
-    fresh.forEach(u => { map[String(u._id)] = u.isOnline; });
-    users.forEach(u => { u.isOnline = map[String(u._id)] ?? false; });
+    fresh.forEach(u => { map[String(u._id)] = u; });
+    const now = Date.now();
+    users.forEach(u => {
+      const f = map[String(u._id)];
+      u.isOnline = f?.isOnline ?? false;
+      u.isTop = Boolean(f?.boostUntil && new Date(f.boostUntil).getTime() > now);
+    });
   } catch (e) {
     console.error('[overlayOnlineStatus] error:', e.message);
   }

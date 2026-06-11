@@ -35,6 +35,9 @@ const userSchema = new mongoose.Schema({
   // Онлайн статус
   isOnline: { type: Boolean, default: false },
   lastSeen: { type: Date, default: null },
+
+  // Буст анкеты — поднимает её в топ ленты до этого момента времени
+  boostUntil: { type: Date, default: null },
 });
 
 const User = mongoose.models.User || mongoose.model('User', userSchema);
