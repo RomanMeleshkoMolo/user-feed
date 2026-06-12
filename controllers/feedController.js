@@ -82,18 +82,15 @@ async function enrichUserWithPhotos(user) {
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
 // +1000 активный буст (анкета поднята в топ)
-// +100  user liked me (pending)
 // +40   online now
 // +20   last seen < 1h
 // +10   last seen < 24h
 // +3    last seen < 7d
 // 0–20  profile completeness
-function scoreUser(user, likedMeSet) {
+function scoreUser(user) {
   let score = 0;
 
   if (user.boostUntil && new Date(user.boostUntil) > new Date()) score += 1000;
-
-  if (likedMeSet.has(String(user._id))) score += 100;
 
   if (user.isOnline) {
     score += 40;
@@ -132,7 +129,17 @@ async function buildFeedData(userId, q = {}) {
   if (!currentUser) return null;
 
   const currentUserObjectId = new mongoose.Types.ObjectId(userId);
-  const filter = { _id: { $ne: currentUserObjectId } };
+
+  // Пользователи, которые уже поставили мне симпатию, отображаются во вкладке
+  // "Симпатии" — больше не показываем их в ленте/анкетах
+  let likedMeIds = [];
+  try {
+    likedMeIds = await Like.find({ toUser: currentUserObjectId }).distinct('fromUser');
+  } catch (e) {
+    console.warn('[feed] Could not fetch likes:', e.message);
+  }
+
+  const filter = { _id: { $nin: [currentUserObjectId, ...likedMeIds] } };
 
   if (q.lookingFor && q.lookingFor !== 'any') filter['gender.id'] = q.lookingFor;
   if (q.ageMin || q.ageMax) {
@@ -176,20 +183,8 @@ async function buildFeedData(userId, q = {}) {
   const hasMore = rawUsers.length > limit;
   const pool    = hasMore ? rawUsers.slice(0, limit) : rawUsers;
 
-  // Who liked me — boost their score
-  let likedMeSet = new Set();
-  try {
-    const likesForMe = await Like.find({
-      toUser: currentUserObjectId,
-      status: 'pending',
-    }).select('fromUser').lean();
-    likesForMe.forEach(l => likedMeSet.add(String(l.fromUser)));
-  } catch (e) {
-    console.warn('[feed] Could not fetch likes:', e.message);
-  }
-
   // Score and sort
-  const scored = pool.map(u => ({ user: u, score: scoreUser(u, likedMeSet) }));
+  const scored = pool.map(u => ({ user: u, score: scoreUser(u) }));
   scored.sort((a, b) => b.score - a.score);
   const sorted = scored.map(s => s.user);
 
