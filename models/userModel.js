@@ -38,6 +38,9 @@ const userSchema = new mongoose.Schema({
 
   // Буст анкеты — поднимает её в топ ленты до этого момента времени
   boostUntil: { type: Date, default: null },
+
+  // Очки активности (0-100), пересчитываются воркером в user-profile
+  activityScore: { type: Number, default: 0 },
 });
 
 const User = mongoose.models.User || mongoose.model('User', userSchema);

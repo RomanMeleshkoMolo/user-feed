@@ -22,6 +22,14 @@ function getReqUserId(req) {
   return req.user?._id || req.user?.id || req.auth?.userId || req.regUserId || req.userId;
 }
 
+// Анкета считается "в топе", если активность пользователя высокая
+// или активен разовый ручной буст
+const ACTIVITY_TOP_THRESHOLD = 70;
+function computeIsTop(user) {
+  const boosted = Boolean(user?.boostUntil && new Date(user.boostUntil) > new Date());
+  return (user?.activityScore || 0) >= ACTIVITY_TOP_THRESHOLD || boosted;
+}
+
 // Presigned URL — кешируем 55 минут
 async function getGetObjectUrl(key, expiresInSec = PRESIGNED_TTL_SEC) {
   if (!key) return null;
@@ -49,7 +57,7 @@ function toFeedUser(user) {
     userSex:      user.userSex,
     isOnline:     user.isOnline || false,
     lastSeen:     user.lastSeen || null,
-    isTop:        Boolean(user.boostUntil && new Date(user.boostUntil) > new Date()),
+    isTop:        computeIsTop(user),
     lookingFor:   user.lookingFor || null,
     about:        user.about || null,
     work:         user.work || null,
@@ -81,14 +89,17 @@ async function enrichUserWithPhotos(user) {
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
-// +1000 активный буст (анкета поднята в топ)
-// +40   online now
-// +20   last seen < 1h
-// +10   last seen < 24h
-// +3    last seen < 7d
-// 0–20  profile completeness
+// 0–1000 activityScore * 10 — основной фактор: чем активнее юзер, тем выше анкета
+// +1000  активный ручной буст (разовый, доступен 1 раз в сутки)
+// +40    online now
+// +20    last seen < 1h
+// +10    last seen < 24h
+// +3     last seen < 7d
+// 0–20   profile completeness
 function scoreUser(user) {
   let score = 0;
+
+  score += (user.activityScore || 0) * 10;
 
   if (user.boostUntil && new Date(user.boostUntil) > new Date()) score += 1000;
 
@@ -198,14 +209,13 @@ async function overlayOnlineStatus(users) {
   if (!users?.length) return;
   try {
     const ids   = users.map(u => u._id);
-    const fresh = await User.find({ _id: { $in: ids } }, { isOnline: 1, boostUntil: 1 }).lean();
+    const fresh = await User.find({ _id: { $in: ids } }, { isOnline: 1, boostUntil: 1, activityScore: 1 }).lean();
     const map   = {};
     fresh.forEach(u => { map[String(u._id)] = u; });
-    const now = Date.now();
     users.forEach(u => {
       const f = map[String(u._id)];
       u.isOnline = f?.isOnline ?? false;
-      u.isTop = Boolean(f?.boostUntil && new Date(f.boostUntil).getTime() > now);
+      u.isTop = computeIsTop(f);
     });
   } catch (e) {
     console.error('[overlayOnlineStatus] error:', e.message);
@@ -297,6 +307,14 @@ async function invalidateCacheHandler(req, res) {
   return res.json({ ok: true });
 }
 
+// POST /internal/invalidate-all — сбросить весь кеш ленты после массового
+// пересчёта activityScore (затрагивает ранжирование всех пользователей)
+async function invalidateAllHandler(req, res) {
+  await delByPattern('feed:*');
+  console.log('[cache] Invalidated ALL feed caches');
+  return res.json({ ok: true });
+}
+
 // POST /feed/:userId/like
 async function likeUser(req, res) {
   try {
@@ -357,5 +375,6 @@ module.exports = {
   getMatches,
   invalidateUserCache,
   invalidateCacheHandler,
+  invalidateAllHandler,
   buildFeedData,
 };
