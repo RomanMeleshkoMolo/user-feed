@@ -3,6 +3,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const helmet = require('helmet');
 const { sanitize } = require('express-mongo-sanitize');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 require('./db');
@@ -17,7 +18,11 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.set('trust proxy', 1);
-app.use(helmet());
+app.use(helmet({
+  frameguard: false,
+  xContentTypeOptions: false,
+  referrerPolicy: false,
+}));
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
@@ -34,6 +39,14 @@ app.use((req, res, next) => {
   if (req.query) sanitize(req.query);
   next();
 });
+
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please slow down' },
+}));
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
