@@ -32,6 +32,10 @@ const userSchema = new mongoose.Schema({
   alcohol: { type: String, default: '' },
   relationship: { type: String, default: '' },
 
+  // Premium
+  premium: { type: Boolean, default: false },
+  premiumUntil: { type: Date, default: null },
+
   // Онлайн статус
   isOnline: { type: Boolean, default: false },
   lastSeen: { type: Date, default: null },
