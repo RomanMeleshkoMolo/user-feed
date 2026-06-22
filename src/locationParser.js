@@ -47,4 +47,4 @@ function buildLocationPattern(location, expansionLevel) {
   }
 }
 
-module.exports = { buildLocationPattern };
+module.exports = { buildLocationPattern, parseLocation, escapeRegex };

@@ -5,7 +5,7 @@ const { get, set, del, delByPattern, hashQuery, TTL } = require('../src/cache');
 
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-const { buildLocationPattern } = require('../src/locationParser');
+const { buildLocationPattern, parseLocation, escapeRegex } = require('../src/locationParser');
 
 const REGION = process.env.AWS_REGION || 'eu-central-1';
 const BUCKET = process.env.S3_BUCKET || 'molo-user-photos';
@@ -183,25 +183,64 @@ async function buildFeedData(userId, q = {}) {
   if (q.relationship) filter.relationship = q.relationship;
   if (q.education)    filter.education = q.education;
 
-  const expansionLevel = parseInt(q.expansionLevel) || 0;
   if (q.location) {
-    const pattern = buildLocationPattern(q.location, expansionLevel);
-    if (pattern) filter.userLocation = { $regex: pattern, $options: 'i' };
+    const { city, region, country } = parseLocation(q.location);
+    const needed = skip + limit + 1;
+    const allUsers = [];
+
+    if (city) {
+      const lvlFilter = { ...filter, userLocation: { $regex: escapeRegex(city), $options: 'i' } };
+      const users = await User.find(lvlFilter).sort({ activityScore: -1 }).limit(needed).lean();
+      users.forEach(u => { u._proximity = 0; });
+      allUsers.push(...users);
+    }
+
+    if (region && allUsers.length < needed) {
+      const foundIds = allUsers.map(u => u._id);
+      const lvlFilter = {
+        ...filter,
+        _id: { $nin: [...filter._id.$nin, ...foundIds] },
+        userLocation: { $regex: escapeRegex(region), $options: 'i' },
+      };
+      const users = await User.find(lvlFilter).sort({ activityScore: -1 }).limit(needed - allUsers.length).lean();
+      users.forEach(u => { u._proximity = 1; });
+      allUsers.push(...users);
+    }
+
+    if (country && allUsers.length < needed) {
+      const foundIds = allUsers.map(u => u._id);
+      const lvlFilter = {
+        ...filter,
+        _id: { $nin: [...filter._id.$nin, ...foundIds] },
+        userLocation: { $regex: escapeRegex(country), $options: 'i' },
+      };
+      const users = await User.find(lvlFilter).sort({ activityScore: -1 }).limit(needed - allUsers.length).lean();
+      users.forEach(u => { u._proximity = 2; });
+      allUsers.push(...users);
+    }
+
+    const scored = allUsers.map(u => ({ user: u, score: scoreUser(u) }));
+    scored.sort((a, b) => a.user._proximity - b.user._proximity || b.score - a.score);
+
+    const paginated = scored.slice(skip, skip + limit + 1);
+    const hasMore = paginated.length > limit;
+    const pool = hasMore ? paginated.slice(0, limit) : paginated;
+    const sorted = pool.map(s => s.user);
+
+    const enrichedUsers = await Promise.all(sorted.map(enrichUserWithPhotos));
+    return { users: enrichedUsers, page, hasMore };
   }
 
-  // Fetch pool (extra for scoring; respect original skip for pagination)
   const rawUsers = await User.find(filter).skip(skip).limit(limit + 1).lean();
   const hasMore = rawUsers.length > limit;
   const pool    = hasMore ? rawUsers.slice(0, limit) : rawUsers;
 
-  // Score and sort
   const scored = pool.map(u => ({ user: u, score: scoreUser(u) }));
   scored.sort((a, b) => b.score - a.score);
   const sorted = scored.map(s => s.user);
 
   const enrichedUsers = await Promise.all(sorted.map(enrichUserWithPhotos));
-
-  return { users: enrichedUsers, page, hasMore, expansionLevel };
+  return { users: enrichedUsers, page, hasMore };
 }
 
 // Overlay свежего isOnline/isTop поверх любого ответа (в т.ч. закешированного)
