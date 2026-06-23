@@ -69,6 +69,7 @@ function toFeedUser(user) {
     smoking:      user.smoking || null,
     alcohol:      user.alcohol || null,
     relationship: user.relationship || null,
+    questionAnswers: user.questionAnswers || {},
   };
 }
 
