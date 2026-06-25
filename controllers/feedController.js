@@ -90,9 +90,9 @@ async function enrichUserWithPhotos(user) {
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
-// 0–1000 activityScore * 10 — основной фактор: чем активнее юзер, тем выше анкета
+// +5000  online now (highest priority — online users always on top)
 // +1000  активный ручной буст (разовый, доступен 1 раз в сутки)
-// +40    online now
+// 0–1000 activityScore * 10
 // +20    last seen < 1h
 // +10    last seen < 24h
 // +3     last seen < 7d
@@ -105,7 +105,7 @@ function scoreUser(user) {
   if (user.boostUntil && new Date(user.boostUntil) > new Date()) score += 1000;
 
   if (user.isOnline) {
-    score += 40;
+    score += 5000;
   } else if (user.lastSeen) {
     const ageMs = Date.now() - new Date(user.lastSeen).getTime();
     if      (ageMs < 3_600_000)   score += 20;
@@ -159,7 +159,6 @@ async function buildFeedData(userId, q = {}) {
     if (q.ageMin) filter.age.$gte = Number(q.ageMin);
     if (q.ageMax) filter.age.$lte = Number(q.ageMax);
   }
-  if (q.online === 'true') filter.isOnline = true;
   if (q.orientation) filter.userSex = q.orientation;
   if (q.goals) {
     const goals = q.goals.split(',').filter(Boolean);
@@ -187,41 +186,56 @@ async function buildFeedData(userId, q = {}) {
   if (q.location) {
     const { city, region, country } = parseLocation(q.location);
     const needed = skip + limit + 1;
+    const onlineWaterfall = q.online === 'true';
     const allUsers = [];
+    const excludeIds = filter._id.$nin.map(id => id);
 
-    if (city) {
-      const lvlFilter = { ...filter, userLocation: { $regex: escapeRegex(city), $options: 'i' } };
-      const users = await User.find(lvlFilter).sort({ activityScore: -1 }).limit(needed).lean();
-      users.forEach(u => { u._proximity = 0; });
+    async function collectLevel(pattern, proximity, isOnlineFilter) {
+      if (!pattern || allUsers.length >= needed) return;
+      const lvlFilter = {
+        ...filter,
+        _id: { $nin: excludeIds },
+        userLocation: { $regex: escapeRegex(pattern), $options: 'i' },
+      };
+      if (isOnlineFilter !== undefined) lvlFilter.isOnline = isOnlineFilter;
+      const users = await User.find(lvlFilter)
+        .sort({ activityScore: -1 })
+        .limit(needed - allUsers.length)
+        .lean();
+      users.forEach(u => {
+        u._proximity = proximity;
+        excludeIds.push(u._id);
+      });
       allUsers.push(...users);
     }
 
-    if (region && allUsers.length < needed) {
-      const foundIds = allUsers.map(u => u._id);
-      const lvlFilter = {
-        ...filter,
-        _id: { $nin: [...filter._id.$nin, ...foundIds] },
-        userLocation: { $regex: escapeRegex(region), $options: 'i' },
-      };
-      const users = await User.find(lvlFilter).sort({ activityScore: -1 }).limit(needed - allUsers.length).lean();
-      users.forEach(u => { u._proximity = 1; });
-      allUsers.push(...users);
-    }
-
-    if (country && allUsers.length < needed) {
-      const foundIds = allUsers.map(u => u._id);
-      const lvlFilter = {
-        ...filter,
-        _id: { $nin: [...filter._id.$nin, ...foundIds] },
-        userLocation: { $regex: escapeRegex(country), $options: 'i' },
-      };
-      const users = await User.find(lvlFilter).sort({ activityScore: -1 }).limit(needed - allUsers.length).lean();
-      users.forEach(u => { u._proximity = 2; });
-      allUsers.push(...users);
+    if (onlineWaterfall) {
+      // Фаза 1: онлайн — город → область → страна
+      await collectLevel(city, 0, true);
+      await collectLevel(region, 1, true);
+      await collectLevel(country, 2, true);
+      // Фаза 2: оффлайн — город → область → страна
+      await collectLevel(city, 0, false);
+      await collectLevel(region, 1, false);
+      await collectLevel(country, 2, false);
+    } else {
+      // Стандарт: город → область → страна (все юзеры)
+      await collectLevel(city, 0, undefined);
+      await collectLevel(region, 1, undefined);
+      await collectLevel(country, 2, undefined);
     }
 
     const scored = allUsers.map(u => ({ user: u, score: scoreUser(u) }));
-    scored.sort((a, b) => a.user._proximity - b.user._proximity || b.score - a.score);
+    if (onlineWaterfall) {
+      scored.sort((a, b) => {
+        const aOn = a.user.isOnline ? 1 : 0;
+        const bOn = b.user.isOnline ? 1 : 0;
+        if (bOn !== aOn) return bOn - aOn;
+        return a.user._proximity - b.user._proximity || b.score - a.score;
+      });
+    } else {
+      scored.sort((a, b) => a.user._proximity - b.user._proximity || b.score - a.score);
+    }
 
     const paginated = scored.slice(skip, skip + limit + 1);
     const hasMore = paginated.length > limit;
@@ -232,7 +246,11 @@ async function buildFeedData(userId, q = {}) {
     return { users: enrichedUsers, page, hasMore };
   }
 
-  const rawUsers = await User.find(filter).skip(skip).limit(limit + 1).lean();
+  const dbSort = q.online === 'true'
+    ? { isOnline: -1, activityScore: -1 }
+    : { activityScore: -1 };
+
+  const rawUsers = await User.find(filter).sort(dbSort).skip(skip).limit(limit + 1).lean();
   const hasMore = rawUsers.length > limit;
   const pool    = hasMore ? rawUsers.slice(0, limit) : rawUsers;
 
